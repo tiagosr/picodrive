@@ -123,6 +123,12 @@ endif
 ifeq "$(PLATFORM)" "libretro"
 OBJS += platform/libretro/libretro.o
 endif
+ifeq "$(PLATFORM)" "emscripten"
+TARGET = PicoDrive.html
+$(TARGET): LDFLAGS += -O3 -s USE_SDL=2 -s USE_ZLIB=1
+platform/emscripten/main.o: CFLAGS += -s USE_SDL=2 -s USE_ZLIB=1
+OBJS += platform/emscripten/main.o
+endif
 
 ifeq "$(USE_FRONTEND)" "1"
 

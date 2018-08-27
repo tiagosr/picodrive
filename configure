@@ -31,7 +31,7 @@ check_define()
 # setting options to "yes" or "no" will make that choice default,
 # "" means "autodetect".
 
-platform_list="generic pandora gp2x opendingux rpi1 rpi2"
+platform_list="generic pandora gp2x opendingux rpi1 rpi2 emscripten"
 platform="generic"
 sound_driver_list="oss alsa sdl"
 sound_drivers=""
@@ -42,6 +42,8 @@ have_arm_neon=""
 have_libavcodec=""
 need_sdl="no"
 need_xlib="no"
+need_zlib="yes"
+need_png="yes"
 # these are for known platforms
 optimize_cortexa8="no"
 optimize_cortexa7="no"
@@ -95,6 +97,11 @@ set_platform()
       # also libm on F100 is not compatible
       MAIN_LDLIBS="$MAIN_LDLIBS -static"
     fi
+    ;;
+  emscripten)
+    need_sdl="no"
+    need_zlib="no"
+    need_png="no"
     ;;
   *)
     fail "unsupported platform: $platform"
@@ -308,11 +315,15 @@ EOF
   compile_object "$@"
 }
 
-MAIN_LDLIBS="$MAIN_LDLIBS -lz"
-check_zlib -lz || fail "please install zlib (libz-dev)"
+if [ "$need_zlib" = "yes" ]; then
+  MAIN_LDLIBS="$MAIN_LDLIBS -lz"
+  check_zlib -lz || fail "please install zlib (libz-dev)"
+fi
 
-MAIN_LDLIBS="-lpng $MAIN_LDLIBS"
-check_libpng || fail "please install libpng (libpng-dev)"
+if [ "$need_png" = "yes" ]; then
+  MAIN_LDLIBS="-lpng $MAIN_LDLIBS"
+  check_libpng || fail "please install libpng (libpng-dev)"
+fi
 
 if check_libavcodec; then
   have_libavcodec="yes"
@@ -330,7 +341,7 @@ if [ "x$sound_drivers" = "x" ]; then
     sound_drivers="$sound_drivers alsa"
     MAIN_LDLIBS="-lasound $MAIN_LDLIBS"
   fi
-  if [ "$need_sdl" = "yes" ] || check_sdl `$SDL_CONFIG --cflags --libs`; then
+  if [ "$need_sdl" = "yes" ] && check_sdl `$SDL_CONFIG --cflags --libs`; then
     sound_drivers="$sound_drivers sdl"
     need_sdl="yes"
   fi

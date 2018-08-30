@@ -49,6 +49,20 @@ void set_input_device_3btn(int index) { PicoSetInputDevice(index, PICO_INPUT_PAD
 EMSCRIPTEN_KEEPALIVE
 void set_input_device_6btn(int index) { PicoSetInputDevice(index, PICO_INPUT_PAD_6BTN); }
 EMSCRIPTEN_KEEPALIVE
+void send_input(int pad, int buttons) {
+    switch (pad)
+    {
+        case 0:
+        case 1:
+            PicoIn.pad[pad] = buttons;
+            break;
+
+        default:
+            break;
+    }
+    
+}
+EMSCRIPTEN_KEEPALIVE
 void set_loop(bool _simulate, bool _render_graphics, bool _render_sound)
 {
     simulate = _simulate;

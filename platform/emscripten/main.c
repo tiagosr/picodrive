@@ -1,8 +1,10 @@
 #include <emscripten.h>
+#include <emscripten/fetch.h>
 #include <SDL2/SDL.h>
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 #include <pico/pico_int.h>
 #include <pico/state.h>
 #include <pico/patch.h>
@@ -12,21 +14,92 @@
 
 SDL_Window *window = NULL;
 SDL_Renderer *renderer = NULL;
-SDL_Surface *surface = NULL;
 SDL_Texture *texture = NULL;
 bool simulate = true;
 bool render_graphics = true;
 bool render_sound = true;
 bool loaded = false;
 SDL_AudioDeviceID sound_dev = 0;
+void* loaded_rom = NULL;
 
 static int em_sound_init();
 
 EMSCRIPTEN_KEEPALIVE
 int cart_insert(unsigned char *buf, unsigned int size, char *config)
 {
-    return PicoCartInsert(buf, size, config);
+    printf("inserting cartridge with size %ul: first bytes: %d %d %d %d\n", size, (int)buf[0], (int)buf[1], (int)buf[2], (int)buf[3]);
+
+    int ret = PicoCartInsert(buf, size, NULL);
+    PicoDetectRegion();
+    PicoLoopPrepare();
+    PsndRerate(1);
+    return ret;
 }
+
+void cart_insert_success(emscripten_fetch_t *fetch) {
+    void *new_rom = malloc(fetch->numBytes);
+    if (new_rom) {
+        if (loaded_rom)
+            PicoCartUnload();
+        memcpy(new_rom, fetch->data, fetch->numBytes);
+        PicoCartInsert(new_rom, fetch->numBytes, NULL);
+        PicoDetectRegion();
+        PicoLoopPrepare();
+        PsndRerate(1);
+        if (loaded_rom)
+            free(loaded_rom);
+        loaded_rom = new_rom;
+        printf("Loaded ROM from %s - %llu bytes\n", fetch->url, fetch->numBytes);
+    } else {
+        fprintf(stderr, "Failed allocating %llu bytes for ROM %s\n", fetch->numBytes, fetch->url);
+    }
+    emscripten_fetch_close(fetch);
+}
+
+void cart_insert_failure(emscripten_fetch_t *fetch) {
+    fprintf(stderr, "Failed getting ROM %s with error code %d\n", fetch->url, fetch->status);
+    emscripten_fetch_close(fetch);
+}
+
+
+EMSCRIPTEN_KEEPALIVE
+void cart_insert_from_url(const char *url)
+{
+    printf("requested ROM %s\n", url);
+    emscripten_fetch_attr_t attr;
+    emscripten_fetch_attr_init(&attr);
+    strcpy(attr.requestMethod, "GET");
+    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_WAITABLE;
+    emscripten_fetch_t *fetch = emscripten_fetch(&attr, url);
+    EMSCRIPTEN_RESULT ret = EMSCRIPTEN_RESULT_TIMED_OUT;
+    while (ret == EMSCRIPTEN_RESULT_TIMED_OUT) {
+        ret = emscripten_fetch_wait(fetch, INFINITY);
+    }
+    if (fetch->status == 200) {
+        void *new_rom = malloc(fetch->numBytes);
+        if (new_rom)
+        {
+            if (loaded_rom)
+                PicoCartUnload();
+            memcpy(new_rom, fetch->data, fetch->numBytes);
+            PicoCartInsert(new_rom, fetch->numBytes, NULL);
+            PicoLoopPrepare();
+            if (loaded_rom)
+                free(loaded_rom);
+            loaded_rom = new_rom;
+            printf("Loaded ROM from %s - %llu bytes\n", fetch->url, fetch->numBytes);
+        }
+        else
+        {
+            fprintf(stderr, "Failed allocating %llu bytes for ROM %s\n", fetch->numBytes, fetch->url);
+        }
+        emscripten_fetch_close(fetch);
+    } else {
+        fprintf(stderr, "Failed getting ROM %s with error code %d\n", fetch->url, fetch->status);
+        emscripten_fetch_close(fetch);
+    }
+}
+
 EMSCRIPTEN_KEEPALIVE
 void cart_unload(void) { PicoCartUnload(); }
 EMSCRIPTEN_KEEPALIVE
@@ -60,7 +133,6 @@ void send_input(int pad, int buttons) {
         default:
             break;
     }
-    
 }
 EMSCRIPTEN_KEEPALIVE
 void set_loop(bool _simulate, bool _render_graphics, bool _render_sound)
@@ -90,10 +162,18 @@ void set_loop(bool _simulate, bool _render_graphics, bool _render_sound)
 
 void em_main_loop(void *something)
 {
+    void *pixels;
+    int pitch;
     if (render_graphics)
     {
         SDL_RenderClear(renderer);
-        SDL_LockSurface(surface);
+        SDL_LockTexture(texture, NULL, &pixels, &pitch);
+        PicoDrawSetOutBuf(pixels, pitch);
+        for (int x = 0; x < 256; x++)
+        {
+            ((uint16_t *)pixels)[x] = x;
+        }
+        
         if (simulate)
         {
             if (loaded)
@@ -106,7 +186,10 @@ void em_main_loop(void *something)
         {
             PicoFrameDrawOnly();
         }
-        SDL_UnlockSurface(surface);
+
+
+        
+        SDL_UnlockTexture(texture);
         SDL_RenderCopy(renderer, texture, NULL, NULL);
         SDL_RenderPresent(renderer);
     }
@@ -114,12 +197,14 @@ void em_main_loop(void *something)
     {
         if (loaded)
         {
+            SDL_LockTexture(texture, NULL, &pixels, &pitch);
+            PicoDrawSetOutBuf(pixels, pitch);
             PicoPatchApply();
-            SDL_LockSurface(surface);
             PicoFrame();
-            SDL_UnlockSurface(surface);
+            SDL_UnlockTexture(texture);
         }
     }
+    //printf("Frame count: %d\n", Pico.m.frame_count);
 }
 
 static void em_audio_mixer_s16(void *user, Uint8 *stream, int len)
@@ -175,7 +260,7 @@ static int em_sound_init()
 
 void emu_video_mode_change(int start_line, int line_count, int is_32_cols)
 {
-    printf("video mode changed!");
+    printf("video mode changed!\n");
     SDL_SetWindowSize(window, is_32_cols ? 256 : 320, line_count);
     emscripten_cancel_main_loop();
     emscripten_set_main_loop_arg(em_main_loop, NULL, Pico.m.pal ? 50 : 60, false);
@@ -226,19 +311,18 @@ int main(int argc, char const *argv[])
 {
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
     SDL_CreateWindowAndRenderer(320, 224, 0, &window, &renderer);
-    surface = SDL_CreateRGBSurfaceWithFormat(0, 320, 240, 16, SDL_PIXELFORMAT_RGB555);
-    texture = SDL_CreateTextureFromSurface(renderer, surface);
+    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB555, SDL_TEXTUREACCESS_STREAMING, 320, 240);
     PicoIn.opt = POPT_EN_STEREO | POPT_EN_FM | POPT_EN_PSG | POPT_EN_Z80 | POPT_EN_MCD_PCM | POPT_EN_MCD_CDDA | POPT_EN_MCD_GFX | POPT_EN_32X | POPT_EN_PWM | POPT_ACC_SPRITES | POPT_DIS_32C_BORDER;
     PicoIn.sndRate = 44100;
     PicoIn.autoRgnOrder = 0x184; // TODO: use parameters here
     PicoInit();
     PicoDrawSetOutFormat(PDF_RGB555, 0);
-    PicoDrawSetOutBuf(surface->pixels, surface->pitch);
-
-    PicoCartInsert(NULL, 0, "");
+    PicoCartInsert(NULL, 0, NULL);
     loaded = true;
+    if (argc > 1) {
+        cart_insert_from_url(argv[1]);
+    }
     emscripten_set_main_loop_arg(em_main_loop, NULL, 60, false);
     //emscripten_set_main_loop_timing(EM_TIMING_SETTIMEOUT, 33);
-
     return 0;
 }

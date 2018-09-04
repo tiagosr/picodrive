@@ -64,11 +64,7 @@ extern "C" {
 
 #define PICODRIVE_HACKS		1
 #define CZ80_LITTLE_ENDIAN		1
-#ifdef __EMSCRIPTEN__
-#define CZ80_USE_JUMPTABLE 0 /* fix issue with WebAssembly not having computed goto */
-#else
 #define CZ80_USE_JUMPTABLE 1
-#endif
 #define CZ80_BIG_FLAGS_ARRAY	1
 //#ifdef BUILD_CPS1PSP
 //#define CZ80_ENCRYPTED_ROM		1

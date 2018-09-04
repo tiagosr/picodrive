@@ -1,5 +1,4 @@
 #include <emscripten.h>
-#include <emscripten/fetch.h>
 #include <SDL2/SDL.h>
 
 #include <stdint.h>
@@ -21,84 +20,65 @@ bool render_sound = true;
 bool loaded = false;
 SDL_AudioDeviceID sound_dev = 0;
 void* loaded_rom = NULL;
+int vdp_start_line = 0;
+int vdp_line_count = 240;
+
+static unsigned short vout_buf[320*240];
+static short snd_buffer[2*48000/50];
+static short snd_queue[65536];
+static int snd_queue_insert_ptr = 0;
+static int snd_queue_read_ptr = 0;
 
 static int em_sound_init();
+static void snd_write(int len) {
+    len = len / 2;
+    for (int i = 0; i < len; i++) {
+        if (snd_queue_insert_ptr >= 65536) snd_queue_insert_ptr -= 65536;
+        snd_queue[snd_queue_insert_ptr] = snd_buffer[len];
+        snd_queue_insert_ptr++;
+    }
+}
+
+static void em_byteswap(void *dst, const void *src, int len)
+{
+    const unsigned int *ps = src;
+    unsigned int *pd = dst;
+    int i, m;
+
+    if (len < 2)
+        return;
+
+    m = 0x00ff00ff;
+    for (i = 0; i < len / 4; i++)
+    {
+        unsigned int t = ps[i];
+        pd[i] = ((t & m) << 8) | ((t & ~m) >> 8);
+    }
+}
 
 EMSCRIPTEN_KEEPALIVE
 int cart_insert(unsigned char *buf, unsigned int size, char *config)
 {
-    printf("inserting cartridge with size %ul: first bytes: %d %d %d %d\n", size, (int)buf[0], (int)buf[1], (int)buf[2], (int)buf[3]);
-
-    int ret = PicoCartInsert(buf, size, NULL);
-    PicoDetectRegion();
-    PicoLoopPrepare();
-    PsndRerate(1);
-    return ret;
-}
-
-void cart_insert_success(emscripten_fetch_t *fetch) {
-    void *new_rom = malloc(fetch->numBytes);
+    if (loaded_rom) {
+        PicoCartUnload();
+    }
+    void* new_rom = malloc(size);
     if (new_rom) {
-        if (loaded_rom)
-            PicoCartUnload();
-        memcpy(new_rom, fetch->data, fetch->numBytes);
-        PicoCartInsert(new_rom, fetch->numBytes, NULL);
+        em_byteswap(new_rom, buf, size);
+        int ret = PicoCartInsert(new_rom, size, NULL);
         PicoDetectRegion();
         PicoLoopPrepare();
-        PsndRerate(1);
+        PsndRerate(0);
         if (loaded_rom)
             free(loaded_rom);
         loaded_rom = new_rom;
-        printf("Loaded ROM from %s - %llu bytes\n", fetch->url, fetch->numBytes);
+        printf("Loaded ROM from cart_insert - %u bytes\n", size);
+        return ret;
     } else {
-        fprintf(stderr, "Failed allocating %llu bytes for ROM %s\n", fetch->numBytes, fetch->url);
-    }
-    emscripten_fetch_close(fetch);
-}
-
-void cart_insert_failure(emscripten_fetch_t *fetch) {
-    fprintf(stderr, "Failed getting ROM %s with error code %d\n", fetch->url, fetch->status);
-    emscripten_fetch_close(fetch);
-}
-
-
-EMSCRIPTEN_KEEPALIVE
-void cart_insert_from_url(const char *url)
-{
-    printf("requested ROM %s\n", url);
-    emscripten_fetch_attr_t attr;
-    emscripten_fetch_attr_init(&attr);
-    strcpy(attr.requestMethod, "GET");
-    attr.attributes = EMSCRIPTEN_FETCH_LOAD_TO_MEMORY | EMSCRIPTEN_FETCH_WAITABLE;
-    emscripten_fetch_t *fetch = emscripten_fetch(&attr, url);
-    EMSCRIPTEN_RESULT ret = EMSCRIPTEN_RESULT_TIMED_OUT;
-    while (ret == EMSCRIPTEN_RESULT_TIMED_OUT) {
-        ret = emscripten_fetch_wait(fetch, INFINITY);
-    }
-    if (fetch->status == 200) {
-        void *new_rom = malloc(fetch->numBytes);
-        if (new_rom)
-        {
-            if (loaded_rom)
-                PicoCartUnload();
-            memcpy(new_rom, fetch->data, fetch->numBytes);
-            PicoCartInsert(new_rom, fetch->numBytes, NULL);
-            PicoLoopPrepare();
-            if (loaded_rom)
-                free(loaded_rom);
-            loaded_rom = new_rom;
-            printf("Loaded ROM from %s - %llu bytes\n", fetch->url, fetch->numBytes);
-        }
-        else
-        {
-            fprintf(stderr, "Failed allocating %llu bytes for ROM %s\n", fetch->numBytes, fetch->url);
-        }
-        emscripten_fetch_close(fetch);
-    } else {
-        fprintf(stderr, "Failed getting ROM %s with error code %d\n", fetch->url, fetch->status);
-        emscripten_fetch_close(fetch);
+        return -1;
     }
 }
+
 
 EMSCRIPTEN_KEEPALIVE
 void cart_unload(void) { PicoCartUnload(); }
@@ -164,16 +144,14 @@ void em_main_loop(void *something)
 {
     void *pixels;
     int pitch;
+    SDL_Rect dst_rect;
+    dst_rect.x = 0;
+    dst_rect.y = -vdp_start_line;
+    dst_rect.w = 320;
+    dst_rect.h = 240;
     if (render_graphics)
     {
         SDL_RenderClear(renderer);
-        SDL_LockTexture(texture, NULL, &pixels, &pitch);
-        PicoDrawSetOutBuf(pixels, pitch);
-        for (int x = 0; x < 256; x++)
-        {
-            ((uint16_t *)pixels)[x] = x;
-        }
-        
         if (simulate)
         {
             if (loaded)
@@ -186,22 +164,28 @@ void em_main_loop(void *something)
         {
             PicoFrameDrawOnly();
         }
-
-
-        
+        SDL_LockTexture(texture, NULL, &pixels, &pitch);
+        for (int y = 0; y < 240; y++) {
+            for (int x = 0; x < 320; x++) {
+                uint16_t rgb16 = vout_buf[x + 320*y];
+                uint32_t rgb = 
+                    (((rgb16&0x1f)*33)>>2) + // [4:0] * [9:0] >> [7:0]
+                    ((((rgb16&0x7e0)*65)>>1) & 0xff00) + // [10:5] * [16:5] >> [15:4] & [15:8]
+                    ((((rgb16&0xf800)*33)<<3) & 0xff0000) + // [15:11] * [20:11] << [23:14] & [23:16]
+                    0xff000000;
+                ((uint32_t*)pixels)[x + 320*y] = rgb;
+            }
+        }
         SDL_UnlockTexture(texture);
-        SDL_RenderCopy(renderer, texture, NULL, NULL);
+        SDL_RenderCopy(renderer, texture, NULL, &dst_rect);
         SDL_RenderPresent(renderer);
     }
     else
     {
         if (loaded)
         {
-            SDL_LockTexture(texture, NULL, &pixels, &pitch);
-            PicoDrawSetOutBuf(pixels, pitch);
             PicoPatchApply();
             PicoFrame();
-            SDL_UnlockTexture(texture);
         }
     }
     //printf("Frame count: %d\n", Pico.m.frame_count);
@@ -213,7 +197,12 @@ static void em_audio_mixer_s16(void *user, Uint8 *stream, int len)
     short *buf = (short *)stream;
     for (int i = 0; i < samples; i++)
     {
-        buf[i] = PicoIn.sndOut[i];
+        if (snd_queue_insert_ptr == snd_queue_read_ptr)
+            return;
+        if (snd_queue_read_ptr >= sizeof(snd_queue))
+            snd_queue_read_ptr -= sizeof(snd_queue);
+        buf[i] = snd_buffer[snd_queue_read_ptr];
+        snd_queue_read_ptr++;
     }
 }
 static int em_sound_init()
@@ -227,7 +216,7 @@ static int em_sound_init()
     as.freq = PicoIn.sndRate;
     as.format = AUDIO_S16;
     as.channels = 2;
-    as.samples = Pico.snd.len;
+    as.samples = 2048;
     as.callback = em_audio_mixer_s16;
 
     SDL_AudioSpec as_got;
@@ -241,17 +230,6 @@ static int em_sound_init()
     {
         PicoIn.sndRate = as_got.freq;
         PsndRerate(1);
-        if (as_got.samples != Pico.snd.len)
-        {
-            SDL_CloseAudioDevice(dev);
-            as_got.samples = Pico.snd.len;
-            dev = SDL_OpenAudioDevice(NULL, 0, &as_got, NULL, 0);
-            if (dev == 0)
-            {
-                fprintf(stderr, "Error opening audio device: %s\n", SDL_GetError());
-                return -1;
-            }
-        }
     }
     SDL_PauseAudioDevice(dev, 0);
     sound_dev = dev;
@@ -262,6 +240,8 @@ void emu_video_mode_change(int start_line, int line_count, int is_32_cols)
 {
     printf("video mode changed!\n");
     SDL_SetWindowSize(window, is_32_cols ? 256 : 320, line_count);
+    vdp_start_line = start_line;
+    vdp_line_count = line_count;
     emscripten_cancel_main_loop();
     emscripten_set_main_loop_arg(em_main_loop, NULL, Pico.m.pal ? 50 : 60, false);
 }
@@ -311,17 +291,22 @@ int main(int argc, char const *argv[])
 {
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
     SDL_CreateWindowAndRenderer(320, 224, 0, &window, &renderer);
-    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB555, SDL_TEXTUREACCESS_STREAMING, 320, 240);
-    PicoIn.opt = POPT_EN_STEREO | POPT_EN_FM | POPT_EN_PSG | POPT_EN_Z80 | POPT_EN_MCD_PCM | POPT_EN_MCD_CDDA | POPT_EN_MCD_GFX | POPT_EN_32X | POPT_EN_PWM | POPT_ACC_SPRITES | POPT_DIS_32C_BORDER;
+    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, 320, 240);
+    PicoIn.opt = POPT_EN_STEREO | POPT_EN_FM | POPT_EN_PSG | POPT_EN_Z80
+        | POPT_EN_MCD_PCM | POPT_EN_MCD_CDDA | POPT_EN_MCD_GFX
+        | POPT_EN_32X | POPT_EN_PWM
+        | POPT_ACC_SPRITES | POPT_DIS_32C_BORDER;
     PicoIn.sndRate = 44100;
     PicoIn.autoRgnOrder = 0x184; // TODO: use parameters here
+    PicoIn.writeSound = snd_write;
+    PicoIn.sndOut = snd_buffer;
+    memset(snd_buffer, 0, sizeof(snd_buffer)*sizeof(snd_buffer[0]));
     PicoInit();
     PicoDrawSetOutFormat(PDF_RGB555, 0);
+    PicoDrawSetOutBuf(vout_buf, 320*2);
     PicoCartInsert(NULL, 0, NULL);
     loaded = true;
-    if (argc > 1) {
-        cart_insert_from_url(argv[1]);
-    }
+    em_sound_init();
     emscripten_set_main_loop_arg(em_main_loop, NULL, 60, false);
     //emscripten_set_main_loop_timing(EM_TIMING_SETTIMEOUT, 33);
     return 0;

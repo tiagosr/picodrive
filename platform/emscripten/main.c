@@ -25,18 +25,24 @@ int vdp_line_count = 240;
 
 static unsigned short vout_buf[320*240];
 static short snd_buffer[2*48000/50];
-static short snd_queue[65536];
-static int snd_queue_insert_ptr = 0;
-static int snd_queue_read_ptr = 0;
+#define SND_QUEUE_SAMPLES 65536
+static short snd_queue[SND_QUEUE_SAMPLES];
+static int snd_queue_insert_idx = 0;
+static int snd_queue_read_idx = 0;
 
 static int em_sound_init();
 static void snd_write(int len) {
-    len = len / 2;
-    for (int i = 0; i < len; i++) {
-        if (snd_queue_insert_ptr >= 65536) snd_queue_insert_ptr -= 65536;
-        snd_queue[snd_queue_insert_ptr] = snd_buffer[len];
-        snd_queue_insert_ptr++;
+    if (sound_dev > 0) {
+        SDL_QueueAudio(sound_dev, PicoIn.sndOut, len);
+        //printf("Enqueuing %d bytes to sound\n", len);
     }
+    //len = len * 2;
+    //for (int i = 0; i < len; i++) {
+    //    if (snd_queue_insert_idx >= SND_QUEUE_SAMPLES)
+    //        snd_queue_insert_idx -= SND_QUEUE_SAMPLES;
+    //    snd_queue[snd_queue_insert_idx] = snd_buffer[i];
+    //    snd_queue_insert_idx++;
+    //}
 }
 
 static void em_byteswap(void *dst, const void *src, int len)
@@ -64,10 +70,17 @@ int cart_insert(unsigned char *buf, unsigned int size, char *config)
     }
     void* new_rom = malloc(size);
     if (new_rom) {
+        PicoIn.AHW = 0;
+        PicoIn.quirks = 0;
         em_byteswap(new_rom, buf, size);
         int ret = PicoCartInsert(new_rom, size, NULL);
         PicoDetectRegion();
         PicoLoopPrepare();
+        snd_queue_insert_idx = 0;
+        snd_queue_read_idx = 0;
+        memset(snd_buffer, 0, sizeof(snd_buffer));
+        memset(snd_queue, 0, sizeof(snd_queue));
+        PicoIn.sndOut = snd_buffer;
         PsndRerate(0);
         if (loaded_rom)
             free(loaded_rom);
@@ -149,6 +162,7 @@ void em_main_loop(void *something)
     dst_rect.y = -vdp_start_line;
     dst_rect.w = 320;
     dst_rect.h = 240;
+    PicoIn.pad[0] = PicoIn.pad[1] = 0;
     if (render_graphics)
     {
         SDL_RenderClear(renderer);
@@ -193,16 +207,16 @@ void em_main_loop(void *something)
 
 static void em_audio_mixer_s16(void *user, Uint8 *stream, int len)
 {
-    int samples = len / 2; // stereo
+    int samples = len / 2; // 2 bytes per sample
     short *buf = (short *)stream;
     for (int i = 0; i < samples; i++)
     {
-        if (snd_queue_insert_ptr == snd_queue_read_ptr)
+        if (snd_queue_insert_idx == snd_queue_read_idx)
             return;
-        if (snd_queue_read_ptr >= sizeof(snd_queue))
-            snd_queue_read_ptr -= sizeof(snd_queue);
-        buf[i] = snd_buffer[snd_queue_read_ptr];
-        snd_queue_read_ptr++;
+        if (snd_queue_read_idx >= SND_QUEUE_SAMPLES)
+            snd_queue_read_idx -= SND_QUEUE_SAMPLES;
+        buf[i] = snd_queue[snd_queue_read_idx];
+        snd_queue_read_idx++;
     }
 }
 static int em_sound_init()
@@ -217,7 +231,8 @@ static int em_sound_init()
     as.format = AUDIO_S16;
     as.channels = 2;
     as.samples = 2048;
-    as.callback = em_audio_mixer_s16;
+    //as.callback = em_audio_mixer_s16;
+    as.callback = NULL;
 
     SDL_AudioSpec as_got;
     int dev = SDL_OpenAudioDevice(NULL, 0, &as, &as_got, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
@@ -231,8 +246,8 @@ static int em_sound_init()
         PicoIn.sndRate = as_got.freq;
         PsndRerate(1);
     }
-    SDL_PauseAudioDevice(dev, 0);
     sound_dev = dev;
+    SDL_PauseAudioDevice(dev, 0);
     return 0;
 }
 
@@ -299,12 +314,17 @@ int main(int argc, char const *argv[])
     PicoIn.sndRate = 44100;
     PicoIn.autoRgnOrder = 0x184; // TODO: use parameters here
     PicoIn.writeSound = snd_write;
+    memset(snd_buffer, 0, sizeof(snd_buffer));
+    memset(snd_queue, 0, sizeof(snd_queue));
     PicoIn.sndOut = snd_buffer;
-    memset(snd_buffer, 0, sizeof(snd_buffer)*sizeof(snd_buffer[0]));
+    PicoIn.overclockM68k = 0;
+    PicoIn.regionOverride = 0;
     PicoInit();
     PicoDrawSetOutFormat(PDF_RGB555, 0);
     PicoDrawSetOutBuf(vout_buf, 320*2);
     PicoCartInsert(NULL, 0, NULL);
+    PicoLoopPrepare();
+    PsndRerate(0);
     loaded = true;
     em_sound_init();
     emscripten_set_main_loop_arg(em_main_loop, NULL, 60, false);

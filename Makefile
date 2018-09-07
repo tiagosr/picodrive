@@ -125,9 +125,9 @@ OBJS += platform/libretro/libretro.o
 endif
 ifeq "$(PLATFORM)" "emscripten"
 TARGET = PicoDrive.html
-$(TARGET): LDFLAGS += -O3 -s USE_SDL=2 -s USE_ZLIB=1 -s WASM=0 -s EXPORTED_FUNCTIONS='["_main","_cart_insert","_send_input"]' -s EXTRA_EXPORTED_RUNTIME_METHODS='["ccall","cwrap"]'
+$(TARGET): LDFLAGS += -O3 -g -s USE_SDL=2 -s USE_ZLIB=1 -s WASM=0 -s EXPORTED_FUNCTIONS='["_main","_cart_insert","_send_input"]' -s EXTRA_EXPORTED_RUNTIME_METHODS='["ccall","cwrap"]' -s ALLOW_MEMORY_GROWTH=1
 platform/emscripten/main.o: CFLAGS += -s USE_SDL=2
-CFLAGS += -s USE_ZLIB=1 -s WASM=0
+CFLAGS += -s USE_ZLIB=1 -s WASM=0 -s ALLOW_MEMORY_GROWTH=1 -g
 OBJS += platform/emscripten/main.o
 endif
 
